@@ -7,6 +7,7 @@ import os
 import re
 import json
 import argparse
+import traceback
 from datetime import datetime
 import csv
 from pathlib import Path
@@ -14,10 +15,21 @@ from pathlib import Path
 class ResumeImporter:
     """Import resume data from LinkedIn or other formats into a structured JSON format."""
 
-    def __init__(self, debug=False):
+    def __init__(self, debug=False, use_transformers=False):
         """Initialize the resume importer."""
         self.resume_data = self._create_empty_template()
         self.debug = debug
+        self.use_transformers = use_transformers
+        
+        if use_transformers:
+            try:
+                import transformers
+                self.transformers_available = True
+                if debug:
+                    print(f"Using transformers version: {transformers.__version__}")
+            except ImportError:
+                self.transformers_available = False
+                print("Warning: Transformers library not available. Using regex-only mode.")
         
     def _create_empty_template(self):
         """Create an empty resume data template."""
@@ -388,12 +400,43 @@ class ResumeImporter:
             print(f"Error processing DOCX resume: {e}")
             return False
     
+    def _post_process_text(self, text):
+        """Post-process extracted text to improve structure recognition."""
+        # Fix common PDF extraction issues
+        
+        # 1. Fix merged email addresses
+        email_pattern = r'([a-zA-Z0-9_.+-]+)at([a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)'
+        text = re.sub(email_pattern, r'\1@\2', text)
+        
+        # 2. Fix line breaks in contact information
+        text = re.sub(r'([0-9]{3})[\s\n]+([0-9]{3})[\s\n]+([0-9]{4})', r'\1-\2-\3', text)
+        
+        # 3. Normalize section headers
+        for section in ['EDUCATION', 'EXPERIENCE', 'SKILLS', 'PROJECTS']:
+            text = re.sub(rf'{section.lower()}', section.upper(), text, flags=re.IGNORECASE)
+        
+        # 4. Insert newlines before probable section headers
+        text = re.sub(r'([^\n])([A-Z]{5,})', r'\1\n\n\2', text)
+        
+        return text
+    
     def _parse_resume_text(self, text):
         """Parse resume text with improved section detection."""
         if self.debug:
             print("Starting resume parsing...")
         
-        # Extract basic personal information first
+        # Try transformer-based extraction first if enabled
+        if self.use_transformers and hasattr(self, 'transformers_available') and self.transformers_available:
+            if self.debug:
+                print("Attempting extraction with transformer models")
+            
+            success = self._extract_with_transformers(text)
+            
+            if success and self.debug:
+                print("Successfully extracted data using transformers")
+                return  # Skip the traditional extraction
+        
+        # Extract basic personal information first (fallback to traditional methods)
         self._extract_personal_info(text)
         self._extract_contact_info(text)
         
@@ -448,6 +491,77 @@ class ResumeImporter:
                 self._extract_certifications(content)
             elif "LANGUAGE" in section_name:
                 self._extract_languages(content)
+    
+    def _extract_personal_info(self, text):
+        """Extract personal information with improved name detection."""
+        # Try multiple name detection approaches
+        
+        # Approach 1: First few lines, looking for name-like patterns
+        first_lines = text.strip().split('\n')[:7]
+        for line in first_lines:
+            line = line.strip()
+            # More flexible name pattern (2-4 words, each capitalized)
+            if re.match(r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}$', line) and len(line) < 40:
+                self.resume_data["basics"]["name"] = line
+                if self.debug:
+                    print(f"Found name (pattern match): {line}")
+                break
+                
+        # Approach 2: Look for common name prefix patterns
+        if not self.resume_data["basics"]["name"]:
+            name_match = re.search(r'(?:Name|NAME):\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})', text)
+            if name_match:
+                self.resume_data["basics"]["name"] = name_match.group(1)
+                if self.debug:
+                    print(f"Found name (prefix match): {name_match.group(1)}")
+    
+    def _extract_contact_info(self, text):
+        """Extract contact information from text."""
+        # Extract email
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        email_matches = re.findall(email_pattern, text)
+        if email_matches:
+            self.resume_data["basics"]["email"] = email_matches[0]
+            if self.debug:
+                print(f"Found email: {email_matches[0]}")
+        
+        # Extract phone number (various formats)
+        phone_patterns = [
+            r'(?:\+\d{1,2}\s)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}',  # (123) 456-7890 or 123-456-7890
+            r'\+\d{1,2}\s\d{3}\s\d{3}\s\d{4}',                       # +1 123 456 7890
+            r'\d{3}[-\.\s]??\d{3}[-\.\s]??\d{4}',                    # 123.456.7890
+            r'\(\d{3}\)\s*\d{3}[-\.\s]??\d{4}'                       # (123) 456-7890
+        ]
+        
+        for pattern in phone_patterns:
+            phone_matches = re.findall(pattern, text)
+            if phone_matches:
+                self.resume_data["basics"]["phone"] = phone_matches[0]
+                if self.debug:
+                    print(f"Found phone: {phone_matches[0]}")
+                break
+        
+        # Extract LinkedIn URL
+        linkedin_patterns = [
+            r'linkedin\.com/in/[\w-]+',
+            r'linkedin\.com/profile/[\w-]+'
+        ]
+        
+        for pattern in linkedin_patterns:
+            linkedin_matches = re.findall(pattern, text, re.IGNORECASE)
+            if linkedin_matches:
+                url = linkedin_matches[0]
+                if not url.startswith('http'):
+                    url = f"https://{url}"
+                
+                self.resume_data["basics"]["profiles"].append({
+                    "network": "LinkedIn",
+                    "url": url,
+                    "username": url.split('/')[-1]
+                })
+                if self.debug:
+                    print(f"Found LinkedIn: {url}")
+                break
     
     def _extract_work_experience(self, text):
         """Extract work experience from text."""
@@ -567,7 +681,7 @@ class ResumeImporter:
                 self.resume_data["education"].append(education_item)
                 if self.debug:
                     print(f"Added education: {study_type} at {institution}")
-
+    
     def _extract_skills(self, text):
         """Extract skills from text."""
         # Look for bullet points or comma-separated skills
@@ -601,102 +715,6 @@ class ResumeImporter:
             
             if self.debug:
                 print(f"Added skill category: {category} with {len(skills)} skills")
-    
-    def _extract_personal_info(self, text):
-        """Extract personal information with improved name detection."""
-        # Try multiple name detection approaches
-        
-        # Approach 1: First few lines, looking for name-like patterns
-        first_lines = text.strip().split('\n')[:7]
-        for line in first_lines:
-            line = line.strip()
-            # More flexible name pattern (2-4 words, each capitalized)
-            if re.match(r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}$', line) and len(line) < 40:
-                self.resume_data["basics"]["name"] = line
-                if self.debug:
-                    print(f"Found name (pattern match): {line}")
-                break
-                
-        # Approach 2: Look for common name prefix patterns
-        if not self.resume_data["basics"]["name"]:
-            name_match = re.search(r'(?:Name|NAME):\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})', text)
-            if name_match:
-                self.resume_data["basics"]["name"] = name_match.group(1)
-                if self.debug:
-                    print(f"Found name (prefix match): {name_match.group(1)}")
-    
-    def _extract_contact_info(self, text):
-        """Extract contact information from text."""
-        # Extract email
-        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-        email_matches = re.findall(email_pattern, text)
-        if email_matches:
-            self.resume_data["basics"]["email"] = email_matches[0]
-            if self.debug:
-                print(f"Found email: {email_matches[0]}")
-        
-        # Extract phone number (various formats)
-        phone_patterns = [
-            r'(?:\+\d{1,2}\s)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}',  # (123) 456-7890 or 123-456-7890
-            r'\+\d{1,2}\s\d{3}\s\d{3}\s\d{4}',                       # +1 123 456 7890
-            r'\d{3}[-\.\s]??\d{3}[-\.\s]??\d{4}',                    # 123.456.7890
-            r'\(\d{3}\)\s*\d{3}[-\.\s]??\d{4}'                       # (123) 456-7890
-        ]
-        
-        for pattern in phone_patterns:
-            phone_matches = re.findall(pattern, text)
-            if phone_matches:
-                self.resume_data["basics"]["phone"] = phone_matches[0]
-                if self.debug:
-                    print(f"Found phone: {phone_matches[0]}")
-                break
-        
-        # Extract LinkedIn URL
-        linkedin_patterns = [
-            r'linkedin\.com/in/[\w-]+',
-            r'linkedin\.com/profile/[\w-]+'
-        ]
-        
-        for pattern in linkedin_patterns:
-            linkedin_matches = re.findall(pattern, text, re.IGNORECASE)
-            if linkedin_matches:
-                url = linkedin_matches[0]
-                if not url.startswith('http'):
-                    url = f"https://{url}"
-                
-                self.resume_data["basics"]["profiles"].append({
-                    "network": "LinkedIn",
-                    "url": url,
-                    "username": url.split('/')[-1]
-                })
-                if self.debug:
-                    print(f"Found LinkedIn: {url}")
-                break
-    
-    def _extract_bullet_points(self, text):
-        """Extract bullet points from text."""
-        bullet_points = re.findall(r'[•\-*]\s*([^•\-*\n]+)', text)
-        return [point.strip() for point in bullet_points if point.strip()]
-
-    def _post_process_text(self, text):
-        """Post-process extracted text to improve structure recognition."""
-        # Fix common PDF extraction issues
-        
-        # 1. Fix merged email addresses
-        email_pattern = r'([a-zA-Z0-9_.+-]+)at([a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)'
-        text = re.sub(email_pattern, r'\1@\2', text)
-        
-        # 2. Fix line breaks in contact information
-        text = re.sub(r'([0-9]{3})[\s\n]+([0-9]{3})[\s\n]+([0-9]{4})', r'\1-\2-\3', text)
-        
-        # 3. Normalize section headers
-        for section in ['EDUCATION', 'EXPERIENCE', 'SKILLS', 'PROJECTS']:
-            text = re.sub(rf'{section.lower()}', section.upper(), text, flags=re.IGNORECASE)
-        
-        # 4. Insert newlines before probable section headers
-        text = re.sub(r'([^\n])([A-Z]{5,})', r'\1\n\n\2', text)
-        
-        return text
     
     def _extract_projects(self, text):
         """Extract projects from text."""
@@ -802,6 +820,85 @@ class ResumeImporter:
                 if self.debug:
                     print(f"Added language: {language}")
     
+    def _extract_bullet_points(self, text):
+        """Extract bullet points from text."""
+        bullet_points = re.findall(r'[•\-*]\s*([^•\-*\n]+)', text)
+        return [point.strip() for point in bullet_points if point.strip()]
+    
+    def _process_education_with_transformers(self, paragraph):
+        """Process education information using transformer models."""
+        # This would be filled in with actual transformer processing logic
+        # For now, extract basic information
+        from transformers import pipeline
+        
+        # Extract education details
+        ner = pipeline("ner")
+        entities = ner(paragraph)
+        
+        # Look for educational institution and degree
+        institution = ""
+        degree = ""
+        date = ""
+        
+        # Process NER results
+        # This is a simplified example
+        for entity in entities:
+            if entity['entity'] == 'I-ORG' and 'university' in entity['word'].lower():
+                institution = entity['word']
+            elif entity['entity'] == 'I-MISC' and any(d in entity['word'].lower() for d in ['bachelor', 'master', 'phd']):
+                degree = entity['word']
+            elif entity['entity'] == 'I-DATE':
+                date = entity['word']
+        
+        # Add to resume data if we found meaningful information
+        if institution or degree:
+            self.resume_data["education"].append({
+                "institution": institution,
+                "area": "",
+                "studyType": degree,
+                "startDate": date,
+                "endDate": "",
+                "score": "",
+                "courses": []
+            })
+    
+    def _process_work_with_transformers(self, paragraph):
+        """Process work experience using transformer models."""
+        # This would be filled in with actual transformer processing logic
+        from transformers import pipeline
+        
+        # Extract work details
+        ner = pipeline("ner")
+        entities = ner(paragraph)
+        
+        # Look for company and position
+        company = ""
+        position = ""
+        date = ""
+        
+        # Process NER results
+        # This is a simplified example
+        for entity in entities:
+            if entity['entity'] == 'I-ORG':
+                company = entity['word']
+            elif entity['entity'] == 'I-MISC' and any(p in entity['word'].lower() for p in ['engineer', 'manager', 'developer']):
+                position = entity['word']
+            elif entity['entity'] == 'I-DATE':
+                date = entity['word']
+        
+        # Add to resume data if we found meaningful information
+        if company or position:
+            self.resume_data["work"].append({
+                "name": company,
+                "position": position,
+                "startDate": date,
+                "endDate": "",
+                "summary": paragraph,
+                "highlights": [],
+                "url": "",
+                "keywords": []
+            })
+    
     def load_from_json(self, file_path):
         """
         Load resume data from an existing JSON file.
@@ -858,6 +955,73 @@ class ResumeImporter:
                 count += sum(1 for value in section.values() if value)
         return count
 
+    def _extract_with_transformers(self, text):
+        """Extract resume information using transformer models."""
+        try:
+            from transformers import pipeline
+            
+            if self.debug:
+                print("Using transformer models for enhanced extraction")
+                
+            # 1. Named Entity Recognition for contact info and personal details
+            try:
+                ner = pipeline("ner")
+                entities = ner(text[:1000])  # Process the first 1000 characters for efficiency
+                
+                # Group entities by type
+                grouped_entities = {}
+                for entity in entities:
+                    if entity['entity'] not in grouped_entities:
+                        grouped_entities[entity['entity']] = []
+                    grouped_entities[entity['entity']].append(entity)
+                
+                # Extract person name
+                if 'I-PER' in grouped_entities and not self.resume_data["basics"]["name"]:
+                    # Logic to reconstruct name from NER tags
+                    name_parts = []
+                    for entity in grouped_entities['I-PER']:
+                        name_parts.append(entity['word'])
+                    if name_parts:
+                        self.resume_data["basics"]["name"] = " ".join(name_parts)
+                        if self.debug:
+                            print(f"Found name with NER: {self.resume_data['basics']['name']}")
+            except Exception as e:
+                if self.debug:
+                    print(f"NER processing error: {e}")
+                
+            # 2. Zero-shot classification for section identification
+            try:
+                classifier = pipeline("zero-shot-classification")
+                
+                # Split text into paragraphs
+                paragraphs = [p for p in re.split(r'\n\s*\n', text) if p.strip() and len(p) > 50]
+                
+                for paragraph in paragraphs:
+                    # Identify which section this paragraph belongs to
+                    result = classifier(
+                        paragraph,
+                        candidate_labels=["education", "work experience", "skills", "projects", "personal information"]
+                    )
+                    
+                    section_type = result['labels'][0]  # Get highest probability section
+                    confidence = result['scores'][0]    # Get confidence score
+                    
+                    if confidence > 0.7:  # Only process if confident enough
+                        if section_type == "education":
+                            self._process_education_with_transformers(paragraph)
+                        elif section_type == "work experience":
+                            self._process_work_with_transformers(paragraph)
+                        # Additional sections could be processed here
+            except Exception as e:
+                if self.debug:
+                    print(f"Classification error: {e}")
+                    
+            return True
+        except ImportError:
+            if self.debug:
+                print("Transformers library not found, falling back to regex methods")
+            return False
+
 
 def main():
     """Parse command line arguments and import resume data."""
@@ -868,11 +1032,12 @@ def main():
     parser.add_argument('--format', choices=['linkedin', 'pdf', 'json', 'docx'], default='auto', 
                         help='Format of the input data')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    parser.add_argument('--use-transformers', action='store_true', help='Use transformer models for enhanced extraction')
 
     args = parser.parse_args()
     
-    # Create resume importer
-    importer = ResumeImporter(debug=args.debug)
+    # Create resume importer with transformer option
+    importer = ResumeImporter(debug=args.debug, use_transformers=args.use_transformers)
     
     # Determine input format if auto
     input_format = args.format
