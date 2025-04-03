@@ -356,11 +356,18 @@ class ResumeImporter:
                 print("------ Extracted Text Preview ------")
                 print(extracted_text[:500])
                 print("-----------------------------------")
+            
+            # Post-process the text to improve structure
+            processed_text = self._post_process_text(extracted_text)
                 
-            self._parse_resume_text(extracted_text)
+            # Parse the processed text
+            self._parse_resume_text(processed_text)
             return True
         except Exception as e:
+            import traceback
             print(f"Error processing PDF resume: {e}")
+            if self.debug:
+                traceback.print_exc()
             return False
     
     def import_from_docx(self, file_path):
@@ -374,6 +381,7 @@ class ResumeImporter:
             if self.debug:
                 print(f"Extracted {len(text)} characters from DOCX")
                 
+            text = self._post_process_text(text)
             self._parse_resume_text(text)
             return True
         except Exception as e:
@@ -384,6 +392,10 @@ class ResumeImporter:
         """Parse resume text with improved section detection."""
         if self.debug:
             print("Starting resume parsing...")
+        
+        # Extract basic personal information first
+        self._extract_personal_info(text)
+        self._extract_contact_info(text)
         
         # Common section headers in resumes
         section_patterns = [
@@ -405,6 +417,11 @@ class ResumeImporter:
         # Find potential section boundaries
         section_matches = list(re.finditer(rf'(?:^|\n)({combined_pattern})(?::|\n|$)', text, re.IGNORECASE))
         
+        if not section_matches and self.debug:
+            print("No standard sections found. Trying alternative detection methods.")
+            # Try with looser patterns if no sections found
+            section_matches = list(re.finditer(r'\n([A-Z][A-Z\s]{2,}:?)\s*\n', text))
+        
         # Extract sections
         sections = {}
         for i, match in enumerate(section_matches):
@@ -415,13 +432,175 @@ class ResumeImporter:
             sections[section_name] = section_content
             
             if self.debug:
-                print(f"Processing section: {section_name}")
-                print(f"Found {len(self.resume_data['work'])} work experiences")
-                print(f"Found {len(self.resume_data['education'])} education entries")
-                print(f"Found {len(self.resume_data['skills'])} skill categories")
+                print(f"Found section: {section_name} ({len(section_content)} chars)")
         
         # Process each section with specialized extractors
-        # Continue with existing section processing...
+        for section_name, content in sections.items():
+            if any(work_pattern in section_name for work_pattern in ["WORK", "EXPERIENCE", "EMPLOYMENT", "PROFESSIONAL"]):
+                self._extract_work_experience(content)
+            elif "EDUCATION" in section_name:
+                self._extract_education(content)
+            elif "SKILLS" in section_name:
+                self._extract_skills(content)
+            elif "PROJECT" in section_name:
+                self._extract_projects(content)
+            elif "CERTIF" in section_name:
+                self._extract_certifications(content)
+            elif "LANGUAGE" in section_name:
+                self._extract_languages(content)
+    
+    def _extract_work_experience(self, text):
+        """Extract work experience from text."""
+        # Split into possible job entries (looking for company or title followed by date)
+        job_entries = re.split(r'\n\s*\n', text)
+        
+        for entry in job_entries:
+            if not entry.strip():
+                continue
+                
+            # Look for job title patterns
+            title_match = re.search(r'^([A-Z][A-Za-z\s,]+)(?:[-–|]|at|\n)', entry, re.MULTILINE)
+            title = title_match.group(1).strip() if title_match else ""
+            
+            # Look for company name
+            company_pattern = r'(?:at|with|for)?\s*([A-Z][A-Za-z0-9\s&,.]+)'
+            company_match = re.search(company_pattern, entry[title_match.end() if title_match else 0:])
+            company = company_match.group(1).strip() if company_match else ""
+            
+            # Look for dates (various formats)
+            date_patterns = [
+                r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4})\s*[-–]\s*((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}|Present|Current)',
+                r'(\d{1,2}/\d{4})\s*[-–]\s*(\d{1,2}/\d{4}|Present|Current)',
+                r'(\d{4})\s*[-–]\s*(\d{4}|Present|Current)'
+            ]
+            
+            start_date = ""
+            end_date = ""
+            
+            for pattern in date_patterns:
+                date_match = re.search(pattern, entry, re.IGNORECASE)
+                if date_match:
+                    start_date = date_match.group(1)
+                    end_date = date_match.group(2)
+                    break
+            
+            # Extract description
+            description_match = re.search(rf"{company_pattern}.*?(?=\n\n|\Z)", entry, re.DOTALL)
+            description = description_match.group(0).strip() if description_match else ""
+            
+            # Only add if we have at minimum a title or company
+            if title or company:
+                work_item = {
+                    "name": company,
+                    "position": title,
+                    "startDate": start_date,
+                    "endDate": end_date,
+                    "summary": description,
+                    "highlights": self._extract_bullet_points(description),
+                    "url": "",
+                    "keywords": self._extract_keywords_from_text(description)
+                }
+                
+                self.resume_data["work"].append(work_item)
+                if self.debug:
+                    print(f"Added work: {title} at {company}")
+    
+    def _extract_education(self, text):
+        """Extract education from text."""
+        edu_entries = re.split(r'\n\s*\n', text)
+        
+        for entry in edu_entries:
+            if not entry.strip():
+                continue
+            
+            # Look for institution name (universities, colleges)
+            institution_patterns = [
+                r'([A-Z][A-Za-z\s&,]+(?:University|College|Institute|School))',
+                r'((?:University|College|Institute|School)\s+of\s+[A-Z][A-Za-z\s&,]+)'
+            ]
+            
+            institution = ""
+            for pattern in institution_patterns:
+                inst_match = re.search(pattern, entry)
+                if inst_match:
+                    institution = inst_match.group(1).strip()
+                    break
+            
+            # Look for degree
+            degree_pattern = r'(?:Bachelor|Master|Ph\.?D|Doctor|Associate)(?:\'s|s)?\s+(?:of|in|degree\s+in)?\s+([A-Za-z\s&,]+)'
+            degree_match = re.search(degree_pattern, entry, re.IGNORECASE)
+            study_type = degree_match.group(0).strip() if degree_match else ""
+            area = degree_match.group(1).strip() if degree_match else ""
+            
+            # Look for dates
+            date_patterns = [
+                r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4})\s*[-–]\s*((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}|Present|Current)',
+                r'(\d{1,2}/\d{4})\s*[-–]\s*(\d{1,2}/\d{4}|Present|Current)',
+                r'(\d{4})\s*[-–]\s*(\d{4}|Present|Current)'
+            ]
+            
+            start_date = ""
+            end_date = ""
+            
+            for pattern in date_patterns:
+                date_match = re.search(pattern, entry, re.IGNORECASE)
+                if date_match:
+                    start_date = date_match.group(1)
+                    end_date = date_match.group(2)
+                    break
+            
+            # Look for GPA
+            gpa_match = re.search(r'GPA:?\s*([\d\.]+)', entry, re.IGNORECASE)
+            score = gpa_match.group(1) if gpa_match else ""
+            
+            if institution or study_type:
+                education_item = {
+                    "institution": institution,
+                    "area": area,
+                    "studyType": study_type,
+                    "startDate": start_date,
+                    "endDate": end_date,
+                    "score": score,
+                    "courses": self._extract_bullet_points(entry)
+                }
+                
+                self.resume_data["education"].append(education_item)
+                if self.debug:
+                    print(f"Added education: {study_type} at {institution}")
+
+    def _extract_skills(self, text):
+        """Extract skills from text."""
+        # Look for bullet points or comma-separated skills
+        skill_lists = re.findall(r'[•\-*]\s*([^•\-*\n]+)', text)
+        if not skill_lists:
+            # Try comma-separated
+            skill_lists = [text]  # Take the entire section
+        
+        all_skills = []
+        for skill_text in skill_lists:
+            # Split by commas or new lines
+            skills = [s.strip() for s in re.split(r',|\n', skill_text) if s.strip()]
+            all_skills.extend(skills)
+        
+        # Group skills by category
+        skill_categories = {}
+        for skill in all_skills:
+            category = self._categorize_skill(skill)
+            if category not in skill_categories:
+                skill_categories[category] = []
+            skill_categories[category].append(skill)
+        
+        # Create skill entries for each category
+        for category, skills in skill_categories.items():
+            skill_item = {
+                "name": category,
+                "level": "",
+                "keywords": skills
+            }
+            self.resume_data["skills"].append(skill_item)
+            
+            if self.debug:
+                print(f"Added skill category: {category} with {len(skills)} skills")
     
     def _extract_personal_info(self, text):
         """Extract personal information with improved name detection."""
@@ -445,6 +624,183 @@ class ResumeImporter:
                 self.resume_data["basics"]["name"] = name_match.group(1)
                 if self.debug:
                     print(f"Found name (prefix match): {name_match.group(1)}")
+    
+    def _extract_contact_info(self, text):
+        """Extract contact information from text."""
+        # Extract email
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        email_matches = re.findall(email_pattern, text)
+        if email_matches:
+            self.resume_data["basics"]["email"] = email_matches[0]
+            if self.debug:
+                print(f"Found email: {email_matches[0]}")
+        
+        # Extract phone number (various formats)
+        phone_patterns = [
+            r'(?:\+\d{1,2}\s)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}',  # (123) 456-7890 or 123-456-7890
+            r'\+\d{1,2}\s\d{3}\s\d{3}\s\d{4}',                       # +1 123 456 7890
+            r'\d{3}[-\.\s]??\d{3}[-\.\s]??\d{4}',                    # 123.456.7890
+            r'\(\d{3}\)\s*\d{3}[-\.\s]??\d{4}'                       # (123) 456-7890
+        ]
+        
+        for pattern in phone_patterns:
+            phone_matches = re.findall(pattern, text)
+            if phone_matches:
+                self.resume_data["basics"]["phone"] = phone_matches[0]
+                if self.debug:
+                    print(f"Found phone: {phone_matches[0]}")
+                break
+        
+        # Extract LinkedIn URL
+        linkedin_patterns = [
+            r'linkedin\.com/in/[\w-]+',
+            r'linkedin\.com/profile/[\w-]+'
+        ]
+        
+        for pattern in linkedin_patterns:
+            linkedin_matches = re.findall(pattern, text, re.IGNORECASE)
+            if linkedin_matches:
+                url = linkedin_matches[0]
+                if not url.startswith('http'):
+                    url = f"https://{url}"
+                
+                self.resume_data["basics"]["profiles"].append({
+                    "network": "LinkedIn",
+                    "url": url,
+                    "username": url.split('/')[-1]
+                })
+                if self.debug:
+                    print(f"Found LinkedIn: {url}")
+                break
+    
+    def _extract_bullet_points(self, text):
+        """Extract bullet points from text."""
+        bullet_points = re.findall(r'[•\-*]\s*([^•\-*\n]+)', text)
+        return [point.strip() for point in bullet_points if point.strip()]
+
+    def _post_process_text(self, text):
+        """Post-process extracted text to improve structure recognition."""
+        # Fix common PDF extraction issues
+        
+        # 1. Fix merged email addresses
+        email_pattern = r'([a-zA-Z0-9_.+-]+)at([a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)'
+        text = re.sub(email_pattern, r'\1@\2', text)
+        
+        # 2. Fix line breaks in contact information
+        text = re.sub(r'([0-9]{3})[\s\n]+([0-9]{3})[\s\n]+([0-9]{4})', r'\1-\2-\3', text)
+        
+        # 3. Normalize section headers
+        for section in ['EDUCATION', 'EXPERIENCE', 'SKILLS', 'PROJECTS']:
+            text = re.sub(rf'{section.lower()}', section.upper(), text, flags=re.IGNORECASE)
+        
+        # 4. Insert newlines before probable section headers
+        text = re.sub(r'([^\n])([A-Z]{5,})', r'\1\n\n\2', text)
+        
+        return text
+    
+    def _extract_projects(self, text):
+        """Extract projects from text."""
+        # Split into possible project entries
+        project_entries = re.split(r'\n\s*\n', text)
+        
+        for entry in project_entries:
+            if not entry.strip():
+                continue
+            
+            # Look for project name/title (usually at the beginning of the entry)
+            title_match = re.search(r'^([A-Z][A-Za-z0-9\s&,.:-]+)', entry, re.MULTILINE)
+            project_name = title_match.group(1).strip() if title_match else ""
+            
+            # Look for dates
+            date_patterns = [
+                r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4})\s*[-–]\s*((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}|Present|Current)',
+                r'(\d{1,2}/\d{4})\s*[-–]\s*(\d{1,2}/\d{4}|Present|Current)',
+                r'(\d{4})\s*[-–]\s*(\d{4}|Present|Current)'
+            ]
+            
+            start_date = ""
+            end_date = ""
+            
+            for pattern in date_patterns:
+                date_match = re.search(pattern, entry, re.IGNORECASE)
+                if date_match:
+                    start_date = date_match.group(1)
+                    end_date = date_match.group(2)
+                    break
+            
+            # Extract description - everything after the title
+            description = entry[title_match.end():].strip() if title_match else entry.strip()
+            
+            # Extract keywords from description
+            keywords = self._extract_keywords_from_text(description)
+            
+            # Extract bullet points (highlights)
+            highlights = self._extract_bullet_points(description)
+            
+            if project_name:
+                project_item = {
+                    "name": project_name,
+                    "description": description,
+                    "startDate": start_date,
+                    "endDate": end_date,
+                    "url": "",
+                    "highlights": highlights,
+                    "keywords": keywords
+                }
+                
+                self.resume_data["projects"].append(project_item)
+                if self.debug:
+                    print(f"Added project: {project_name}")
+    
+    def _extract_certifications(self, text):
+        """Extract certifications from text."""
+        cert_entries = re.split(r'\n\s*\n', text)
+        
+        for entry in cert_entries:
+            if not entry.strip():
+                continue
+            
+            # Look for certification name
+            cert_name = ""
+            first_line = entry.split('\n')[0].strip()
+            if first_line:
+                cert_name = first_line
+            
+            # Look for issuer
+            issuer_match = re.search(r'(?:issued|awarded|certified)\s+by\s+([A-Za-z\s&,.]+)', entry, re.IGNORECASE)
+            issuer = issuer_match.group(1).strip() if issuer_match else ""
+            
+            # Look for date
+            date_match = re.search(r'(?:issued|awarded|completed|earned)\s+(?:on|in)\s+(\w+\s+\d{4}|\d{2}/\d{4}|\d{4})', entry, re.IGNORECASE)
+            date = date_match.group(1) if date_match else ""
+            
+            if cert_name:
+                cert_item = {
+                    "name": cert_name,
+                    "date": date,
+                    "issuer": issuer,
+                    "url": "",
+                    "keywords": self._extract_keywords_from_text(entry)
+                }
+                
+                self.resume_data["certificates"].append(cert_item)
+                if self.debug:
+                    print(f"Added certification: {cert_name}")
+    
+    def _extract_languages(self, text):
+        """Extract language skills from text."""
+        # Try to find language entries (usually language name followed by proficiency)
+        language_entries = re.findall(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*[:-]?\s*(Native|Fluent|Professional|Intermediate|Basic|Beginner|Advanced)?', text)
+        
+        for language, fluency in language_entries:
+            if language.strip():
+                self.resume_data["languages"].append({
+                    "language": language.strip(),
+                    "fluency": fluency.strip() if fluency else "Fluent"
+                })
+                
+                if self.debug:
+                    print(f"Added language: {language}")
     
     def load_from_json(self, file_path):
         """
