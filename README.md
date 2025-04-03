@@ -136,7 +136,7 @@ Contributions are welcome! Here's how you can contribute:
 4. Push to the branch `git push origin feature/[feature_name]`
 5. Open a Pull Request
 ## License
-This project is licensed under the MIT License - see the LICENSE file for details.
+
 ## Acknowledgements
 - [pdfminer.six](https://github.com/pdfminer/pdfminer.six) for PDF text extraction
 - [Hugging Face Transformers](https://github.com/huggingface/transformers) for NLP capabilities
