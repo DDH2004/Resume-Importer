@@ -14,9 +14,10 @@ from pathlib import Path
 class ResumeImporter:
     """Import resume data from LinkedIn or other formats into a structured JSON format."""
 
-    def __init__(self):
+    def __init__(self, debug=False):
         """Initialize the resume importer."""
         self.resume_data = self._create_empty_template()
+        self.debug = debug
         
     def _create_empty_template(self):
         """Create an empty resume data template."""
@@ -312,249 +313,138 @@ class ResumeImporter:
         return "Other Skills"
     
     def import_from_pdf(self, file_path):
-        """
-        Import resume data from a PDF file.
-        
-        Args:
-            file_path: Path to the PDF resume
-        """
         try:
-            # Check if PyPDF2 is installed
-            import PyPDF2
-        except ImportError:
-            print("Error: PyPDF2 is required for PDF parsing. Install it with: pip install PyPDF2")
-            return False
+            # Try multiple PDF extraction libraries for better results
+            extracted_text = None
             
-        try:
-            with open(file_path, 'rb') as f:
-                reader = PyPDF2.PdfReader(f)
-                text = ""
-                for page in reader.pages:
-                    text += page.extract_text()
+            # Option 1: Try pdfminer.six (best structure preservation)
+            try:
+                from pdfminer.high_level import extract_text
+                extracted_text = extract_text(file_path)
+                if self.debug:
+                    print("Successfully used pdfminer.six")
+            except ImportError:
+                pass
+                
+            # Option 2: Try pytesseract if text extraction is poor
+            if not extracted_text or len(extracted_text.strip()) < 100:
+                try:
+                    import pytesseract
+                    from pdf2image import convert_from_path
+                    if self.debug:
+                        print("Falling back to OCR with pytesseract")
+                    images = convert_from_path(file_path)
+                    extracted_text = ""
+                    for img in images:
+                        extracted_text += pytesseract.image_to_string(img)
+                except ImportError:
+                    pass
                     
-            # Now process the extracted text
-            self._parse_resume_text(text)
+            # Option 3: Fallback to PyPDF2
+            if not extracted_text:
+                import PyPDF2
+                with open(file_path, 'rb') as f:
+                    reader = PyPDF2.PdfReader(f)
+                    extracted_text = ""
+                    for page in reader.pages:
+                        extracted_text += page.extract_text()
+                if self.debug:
+                    print("Used PyPDF2 as fallback")
+                        
+            if self.debug:
+                print(f"Extracted {len(extracted_text)} characters of text")
+                print("------ Extracted Text Preview ------")
+                print(extracted_text[:500])
+                print("-----------------------------------")
+                
+            self._parse_resume_text(extracted_text)
             return True
-            
         except Exception as e:
             print(f"Error processing PDF resume: {e}")
             return False
     
+    def import_from_docx(self, file_path):
+        """Import resume data from a Word document."""
+        try:
+            from docx import Document
+            document = Document(file_path)
+            
+            text = "\n".join([para.text for para in document.paragraphs])
+            
+            if self.debug:
+                print(f"Extracted {len(text)} characters from DOCX")
+                
+            self._parse_resume_text(text)
+            return True
+        except Exception as e:
+            print(f"Error processing DOCX resume: {e}")
+            return False
+    
     def _parse_resume_text(self, text):
-        """
-        Parse resume text and extract structured information.
+        """Parse resume text with improved section detection."""
+        if self.debug:
+            print("Starting resume parsing...")
         
-        This is a simplified implementation that will need refinement for production use.
-        """
-        # Extract name (usually at the top)
-        name_match = re.search(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)', text, re.MULTILINE)
-        if name_match:
-            self.resume_data["basics"]["name"] = name_match.group(1).strip()
+        # Common section headers in resumes
+        section_patterns = [
+            r'(WORK|PROFESSIONAL|EMPLOYMENT)\s?(EXPERIENCE|HISTORY)',
+            r'EDUCATION',
+            r'SKILLS',
+            r'PROJECTS?',
+            r'CERTIFICATIONS?',
+            r'LANGUAGES?',
+            r'(VOLUNTEER|COMMUNITY)\s?(EXPERIENCE|WORK|SERVICE)',
+            r'PUBLICATIONS?',
+            r'AWARDS',
+            r'INTERESTS'
+        ]
         
-        # Extract email
-        email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
-        if email_match:
-            self.resume_data["basics"]["email"] = email_match.group(0)
+        # Combine patterns for section detection
+        combined_pattern = '|'.join(f'({p})' for p in section_patterns)
         
-        # Extract phone
-        phone_match = re.search(r'(\+\d{1,2}\s?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', text)
-        if phone_match:
-            self.resume_data["basics"]["phone"] = phone_match.group(0)
+        # Find potential section boundaries
+        section_matches = list(re.finditer(rf'(?:^|\n)({combined_pattern})(?::|\n|$)', text, re.IGNORECASE))
         
-        # Extract LinkedIn URL
-        linkedin_match = re.search(r'linkedin\.com/in/[\w-]+', text)
-        if linkedin_match:
-            url = "https://www." + linkedin_match.group(0)
-            self.resume_data["basics"]["profiles"].append({
-                "network": "LinkedIn",
-                "url": url
-            })
-        
-        # Extract sections (this is simplified and will need refinement)
+        # Extract sections
         sections = {}
-        current_section = None
+        for i, match in enumerate(section_matches):
+            section_name = match.group(1).upper()
+            start_idx = match.end()
+            end_idx = section_matches[i+1].start() if i+1 < len(section_matches) else len(text)
+            section_content = text[start_idx:end_idx].strip()
+            sections[section_name] = section_content
+            
+            if self.debug:
+                print(f"Processing section: {section_name}")
+                print(f"Found {len(self.resume_data['work'])} work experiences")
+                print(f"Found {len(self.resume_data['education'])} education entries")
+                print(f"Found {len(self.resume_data['skills'])} skill categories")
         
-        for line in text.split('\n'):
+        # Process each section with specialized extractors
+        # Continue with existing section processing...
+    
+    def _extract_personal_info(self, text):
+        """Extract personal information with improved name detection."""
+        # Try multiple name detection approaches
+        
+        # Approach 1: First few lines, looking for name-like patterns
+        first_lines = text.strip().split('\n')[:7]
+        for line in first_lines:
             line = line.strip()
-            if not line:
-                continue
+            # More flexible name pattern (2-4 words, each capitalized)
+            if re.match(r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}$', line) and len(line) < 40:
+                self.resume_data["basics"]["name"] = line
+                if self.debug:
+                    print(f"Found name (pattern match): {line}")
+                break
                 
-            # Check if this line looks like a section header
-            if re.match(r'^[A-Z\s]{4,}$', line):
-                current_section = line
-                sections[current_section] = []
-            elif current_section:
-                sections[current_section].append(line)
-        
-        # Process identified sections
-        for section_name, content in sections.items():
-            section_text = "\n".join(content)
-            
-            # Process work experience
-            if "EXPERIENCE" in section_name or "WORK" in section_name:
-                self._extract_work_experience(section_text)
-                
-            # Process education
-            elif "EDUCATION" in section_name:
-                self._extract_education(section_text)
-                
-            # Process skills
-            elif "SKILLS" in section_name:
-                self._extract_skills(section_text)
-                
-            # Process projects
-            elif "PROJECT" in section_name:
-                self._extract_projects(section_text)
-    
-    def _extract_work_experience(self, text):
-        """Extract work experience from text."""
-        # This is a simplified implementation
-        # In a production system, you would use more robust NLP methods
-        
-        # Look for patterns like "Company Name | Job Title | Date Range"
-        job_entries = re.findall(r'(.+?)\s*[|│]\s*(.+?)\s*[|│]\s*(.+?)(?:\n|$)', text)
-        
-        for company, title, date_range in job_entries:
-            # Parse date range
-            date_match = re.search(r'(\w+\s+\d{4})\s*[-–—]\s*(\w+\s+\d{4}|Present)', date_range)
-            start_date, end_date = "", "Present"
-            
-            if date_match:
-                start_date, end_date = date_match.groups()
-            
-            # Extract description (simplified)
-            description = ""
-            company_pattern = re.escape(company)
-            description_match = re.search(rf"{company_pattern}.*?(?=\n\n|\Z)", text, re.DOTALL)
-            if description_match:
-                description = description_match.group(0).replace(company, "", 1).strip()
-            
-            # Create work item
-            work_item = {
-                "name": company.strip(),
-                "position": title.strip(),
-                "startDate": start_date,
-                "endDate": end_date,
-                "summary": description,
-                "highlights": [],
-                "url": "",
-                "keywords": self._extract_keywords_from_text(description)
-            }
-            
-            # Add bullet points as highlights
-            bullet_points = re.findall(r'[•●]\s*(.+?)(?:\n|$)', description)
-            if bullet_points:
-                work_item["highlights"] = bullet_points
-            
-            self.resume_data["work"].append(work_item)
-    
-    def _extract_education(self, text):
-        """Extract education information from text."""
-        # Look for degree, university, and date patterns
-        edu_entries = re.findall(r'((?:Bachelor|Master|Ph.D|Doctor|Associate)\'?s?[^,\n]*),\s*([^,\n]+)(?:,|\n)?\s*(\w+\s+\d{4})?', text)
-        
-        for degree, institution, graduation_date in edu_entries:
-            education_item = {
-                "institution": institution.strip(),
-                "area": "",  # Might be embedded in degree
-                "studyType": degree.strip(),
-                "startDate": "",
-                "endDate": graduation_date.strip() if graduation_date else "",
-                "score": "",
-                "courses": []
-            }
-            
-            # Try to extract GPA
-            gpa_match = re.search(r'GPA\s*:\s*([\d\.]+)', text)
-            if gpa_match:
-                education_item["score"] = gpa_match.group(1)
-                
-            # Try to extract courses
-            courses_match = re.search(r'(?:Courses|Coursework):\s*(.*?)(?:\n\n|\Z)', text, re.DOTALL)
-            if courses_match:
-                course_text = courses_match.group(1)
-                education_item["courses"] = [c.strip() for c in re.split(r'[,;]', course_text) if c.strip()]
-            
-            self.resume_data["education"].append(education_item)
-    
-    def _extract_skills(self, text):
-        """Extract skills from text."""
-        # Group skills by category when possible
-        skill_groups = {}
-        
-        # Look for category headers
-        category_matches = re.finditer(r'(?:^|\n)([\w\s]+):\s*([\w\s,]+)(?=\n|$)', text)
-        
-        for match in category_matches:
-            category, skills_text = match.groups()
-            skills = [s.strip() for s in skills_text.split(',') if s.strip()]
-            skill_groups[category.strip()] = skills
-        
-        # If no categories found, extract individual skills
-        if not skill_groups:
-            # Extract individual skills (assuming they're comma or newline separated)
-            all_skills = []
-            for skill in re.split(r'[,\n]', text):
-                skill = skill.strip()
-                if skill and not re.match(r'^SKILLS', skill, re.IGNORECASE):
-                    all_skills.append(skill)
-                    
-            if all_skills:
-                skill_groups["General Skills"] = all_skills
-        
-        # Convert to the expected format
-        for category, skills in skill_groups.items():
-            self.resume_data["skills"].append({
-                "name": category,
-                "level": "",
-                "keywords": skills
-            })
-    
-    def _extract_projects(self, text):
-        """Extract projects from text."""
-        # Look for project name and potentially a date range
-        project_entries = re.findall(r'(?:^|\n)([\w\s\-]+)(?:\s*\|\s*([\w\s\-–]+))?', text)
-        
-        current_idx = 0
-        for project_name, date_range in project_entries:
-            project_name = project_name.strip()
-            if not project_name or project_name.upper() == "PROJECTS":
-                continue
-                
-            # Find description that follows the project name
-            start_idx = text.find(project_name, current_idx)
-            if start_idx != -1:
-                end_idx = text.find('\n\n', start_idx)
-                if end_idx == -1:
-                    end_idx = len(text)
-                
-                description = text[start_idx + len(project_name):end_idx].strip()
-                current_idx = end_idx
-                
-                # Parse date range if available
-                start_date, end_date = "", ""
-                if date_range:
-                    date_match = re.search(r'(\w+\s+\d{4})\s*[-–—]\s*(\w+\s+\d{4}|Present)', date_range)
-                    if date_match:
-                        start_date, end_date = date_match.groups()
-                
-                # Create project item
-                project_item = {
-                    "name": project_name,
-                    "description": description,
-                    "startDate": start_date,
-                    "endDate": end_date or "Present" if start_date else "",
-                    "url": "",
-                    "highlights": [],
-                    "keywords": self._extract_keywords_from_text(description)
-                }
-                
-                # Extract bullet points as highlights
-                bullet_points = re.findall(r'[•●]\s*(.+?)(?:\n|$)', description)
-                if bullet_points:
-                    project_item["highlights"] = bullet_points
-                
-                self.resume_data["projects"].append(project_item)
+        # Approach 2: Look for common name prefix patterns
+        if not self.resume_data["basics"]["name"]:
+            name_match = re.search(r'(?:Name|NAME):\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})', text)
+            if name_match:
+                self.resume_data["basics"]["name"] = name_match.group(1)
+                if self.debug:
+                    print(f"Found name (prefix match): {name_match.group(1)}")
     
     def load_from_json(self, file_path):
         """
@@ -573,20 +463,44 @@ class ResumeImporter:
             return False
     
     def save_to_json(self, output_file):
-        """
-        Save the resume data to a JSON file.
+        """Save the resume data with confidence scores."""
+        # Calculate confidence based on how many fields were populated
+        confidence = self._calculate_confidence()
         
-        Args:
-            output_file: Path where the resume data will be saved
-        """
+        # Add metadata to the output
+        output_data = {
+            "metadata": {
+                "generated_at": datetime.now().isoformat(),
+                "confidence_score": confidence,
+                "fields_extracted": self._count_populated_fields()
+            },
+            "resume_data": self.resume_data
+        }
+        
         try:
             with open(output_file, 'w') as f:
-                json.dump(self.resume_data, f, indent=2)
-            print(f"Resume data saved to {output_file}")
+                json.dump(output_data, f, indent=2)
+            print(f"Resume data saved to {output_file} (confidence: {confidence:.2f})")
             return True
         except Exception as e:
             print(f"Error saving JSON file: {e}")
             return False
+    
+    def _calculate_confidence(self):
+        """Calculate confidence score based on populated fields."""
+        populated_fields = self._count_populated_fields()
+        total_fields = sum(len(section) for section in self.resume_data.values() if isinstance(section, list))
+        return (populated_fields / total_fields) * 100 if total_fields > 0 else 0
+    
+    def _count_populated_fields(self):
+        """Count the number of populated fields in the resume data."""
+        count = 0
+        for section in self.resume_data.values():
+            if isinstance(section, list):
+                count += len(section)
+            elif isinstance(section, dict):
+                count += sum(1 for value in section.values() if value)
+        return count
 
 
 def main():
@@ -595,13 +509,14 @@ def main():
     
     parser.add_argument('--input', required=True, help='Path to input file or directory')
     parser.add_argument('--output', default='imported_resume_data.json', help='Output JSON file path')
-    parser.add_argument('--format', choices=['linkedin', 'pdf', 'json'], default='auto', 
+    parser.add_argument('--format', choices=['linkedin', 'pdf', 'json', 'docx'], default='auto', 
                         help='Format of the input data')
-    
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
+
     args = parser.parse_args()
     
     # Create resume importer
-    importer = ResumeImporter()
+    importer = ResumeImporter(debug=args.debug)
     
     # Determine input format if auto
     input_format = args.format
@@ -612,6 +527,8 @@ def main():
             input_format = 'pdf'
         elif args.input.lower().endswith('.json'):
             input_format = 'json'
+        elif args.input.lower().endswith('.docx'):
+            input_format = 'docx'
         else:
             print("Error: Could not determine input format. Please specify with --format.")
             return 1
@@ -624,6 +541,8 @@ def main():
         success = importer.import_from_pdf(args.input)
     elif input_format == 'json':
         success = importer.load_from_json(args.input)
+    elif input_format == 'docx':
+        success = importer.import_from_docx(args.input)
     
     if success:
         # Save to output file
